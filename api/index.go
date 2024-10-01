@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -18,7 +19,6 @@ func internalServerError(w http.ResponseWriter, err error) {
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-
 	defer func() {
 		if err := recover(); err != nil {
 			log.Printf("WithHandler panic: %v", err)
@@ -39,73 +39,112 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redirect to the GitHub repository
-	if r.URL.Path == "/" {
-		http.Redirect(w, r, "https://github.com/TBXark/vercel-proxy", http.StatusMovedPermanently)
-		return
-	}
-
 	// Get the URL to proxy
-	re := regexp.MustCompile(`^/*(https?:)/*`)
-	u := re.ReplaceAllString(r.URL.Path, "$1//")
-	if r.URL.RawQuery != "" {
-		u += "?" + r.URL.RawQuery
-	}
-	if !strings.HasPrefix(u, "http") {
-		http.Error(w, "invalid url: "+u, http.StatusBadRequest)
+	targetURL := getTargetURL(r)
+	if targetURL == "" {
+		http.Error(w, "invalid url", http.StatusBadRequest)
 		return
 	}
 
 	// Create a new request
-	req, err := http.NewRequest(r.Method, u, r.Body)
+	req, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
 		internalServerError(w, err)
 		return
 	}
-	for k, v := range r.Header {
-		for _, vv := range v {
-			req.Header.Add(k, vv)
-		}
-	}
+
+	// Copy headers from the original request
+	copyHeaders(req.Header, r.Header)
+
 	if htmlProxy && r.Header.Get("Accept-Encoding") != "" {
 		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			req.Header.Set("Accept-Encoding", "gzip")
 		}
 	}
 
-	// Send the request to the real server
-	resp, err := http.DefaultClient.Do(req)
+	// Send the request to the target server
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Disable following redirects
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		internalServerError(w, err)
 		return
 	}
-	defer func(writer http.ResponseWriter, response *http.Response) {
-		internalServerError(writer, response.Body.Close())
-	}(w, resp)
+	defer resp.Body.Close()
 
-	if e := proxyRaw(w, resp, r); e != nil {
-		internalServerError(w, e)
-		return
-	}
-
-	w.WriteHeader(resp.StatusCode)
-}
-
-func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request) error {
-	for k, v := range resp.Header {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
+	// Handle redirects
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := resp.Header.Get("Location")
+		if location != "" {
+			w.Header().Set("Location", rewriteURL(location, r))
 		}
 	}
-	if w.Header().Get("Referer") != "" {
-		w.Header().Del("Referer")
-		w.Header().Add("Referer", req.Host)
+
+	if err := proxyResponse(w, resp, r); err != nil {
+		internalServerError(w, err)
+		return
+	}
+}
+
+func getTargetURL(r *http.Request) string {
+	re := regexp.MustCompile(`^/*(https?:)/*`)
+	u := re.ReplaceAllString(r.URL.Path, "$1//")
+	if r.URL.RawQuery != "" {
+		u += "?" + r.URL.RawQuery
+	}
+	if !strings.HasPrefix(u, "http") {
+		return ""
+	}
+	return u
+}
+
+func copyHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func proxyResponse(w http.ResponseWriter, resp *http.Response, req *http.Request) error {
+	// Copy headers from the proxied response
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
 	}
 
-	// Copy the response body to the output stream
-	_, err := io.Copy(w, resp.Body)
-	if err != nil {
-		return err
+	// Rewrite certain headers
+	if referer := w.Header().Get("Referer"); referer != "" {
+		w.Header().Set("Referer", req.Host)
 	}
-	return nil
+
+	// Rewrite URLs in Location header
+	if location := w.Header().Get("Location"); location != "" {
+		w.Header().Set("Location", rewriteURL(location, req))
+	}
+
+	// Set the status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy the response body
+	_, err := io.Copy(w, resp.Body)
+	return err
+}
+
+func rewriteURL(originalURL string, r *http.Request) string {
+	u, err := url.Parse(originalURL)
+	if err != nil {
+		return originalURL
+	}
+
+	// Construct the new URL
+	newURL := fmt.Sprintf("%s://%s/%s://%s%s", r.URL.Scheme, r.Host, u.Scheme, u.Host, u.Path)
+	if u.RawQuery != "" {
+		newURL += "?" + u.RawQuery
+	}
+	return newURL
 }
